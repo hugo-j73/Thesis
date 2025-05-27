@@ -1,0 +1,115 @@
+---
+title: "Data_grib_to_csv"
+author: "H.JUGAND"
+date: "2025-05-05"
+output: word_document
+---
+
+```{r}
+# Importation of the libraries
+
+library(ncdf4)
+library(reshape2)
+library(dplyr)
+library(lubridate)
+
+# Find and import all the .nc files of the choosen repertory
+nc_files <- list.files(path = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Database/Climate data/V2. Daily/Thermal comfort and residential appeal/2m temperature", 
+                       pattern = "^Data_\\d{4}\\.nc$",  # You need to build your files as following "Data_2014.nc"
+                       full.names = TRUE)
+```
+
+```{r}
+
+# Here we check :
+    # - The first day of your data
+    # - The number of days included on your files
+    # - The type of units (days, weeks, month, year)
+    # - The beginning of your series
+    # - The end of your series
+
+nc_files <- list.files(path=".", pattern="^Data_\\d{4}\\.nc$", full.names=TRUE)
+
+for(f in nc_files){
+  nc <- nc_open(f)
+  time_raw   <- ncvar_get(nc, "valid_time")
+  time_units <- ncatt_get(nc, "valid_time", "units")$value
+  nc_close(nc)
+  
+  cat(sprintf("%s → %d pas de temps, unités = %s\n", 
+              f, length(time_raw), time_units))
+  cat("  début :", head(time_raw), "\n")
+  cat("  fin   :", tail(time_raw), "\n\n")
+}
+```
+
+```{r}
+
+# We list the variables of the files to import them in the next part
+nc_files <- list.files(path = ".", pattern = "^Data_\\d{4}\\.nc$", full.names = TRUE)
+
+lapply(nc_files, function(f){
+  nc <- nc_open(f)
+  on.exit(nc_close(nc), add = TRUE)
+  cat("=== Fichier:", f, "===\n")
+  print(names(nc$var))
+})
+```
+
+
+
+```{r}
+library(ncdf4)
+library(dplyr)
+library(lubridate)
+
+read_one <- function(nc_path){
+  nc <- nc_open(nc_path)
+  on.exit(nc_close(nc))
+  
+  # 1) Read the coordinates
+  lon_vals  <- nc$dim[["longitude"]] $vals
+  lat_vals  <- nc$dim[["latitude"]]  $vals
+  
+  # 2) Read valid_time and build the real dates
+  time_raw   <- ncvar_get(nc, "valid_time")
+  time_units <- ncatt_get(nc, "valid_time", "units")$value
+  parts      <- strsplit(time_units, " since ")[[1]]
+  origin     <- as.Date(parts[2])
+  dates      <- origin + days(time_raw)
+  
+  # 3) read the cube v10[time,lat,lon] 
+  arr_u10 <- ncvar_get(nc, "t2m")     # dimensions: (365, 5, 7)
+  
+  # 4) rearange to get [lon, lat, time] on our future csv
+  arr2 <- aperm(arr_u10, c(3, 2, 1))   # dims: (7, 5, 365)
+  
+  # 5) deploy data.frame
+  df <- expand.grid(
+    lon  = lon_vals,
+    lat  = lat_vals,
+    time = dates
+  )
+  df$u10    <- as.vector(arr2)
+  df$number <- ncvar_get(nc, "number")  # not obligatory, normally its zero on all the data.frame
+  
+  return(df)
+}
+
+#— apply it to all the imported files
+files   <- list.files(pattern="^Data_\\d{4}\\.nc$", full.names=TRUE)
+all_dat <- do.call(rbind, lapply(files, read_one))
+
+#— forcer un format ISO pour Excel 
+all_dat <- all_dat %>%
+  mutate(time = format(time, "%Y-%m-%d"))
+
+#— write the result
+write.csv(all_dat,
+          "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Database/Climate data/V2. Daily/Thermal comfort and residential appeal/2m temperature/combined_t2m_number.csv",
+          row.names = FALSE)
+
+message("✅ GData well exported in CSV ")
+
+```
+
