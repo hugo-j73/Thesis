@@ -1,0 +1,176 @@
+---
+title: "Weather_VaR"
+author: "H.JUGAND"
+date: "2025-05-07"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+library(readxl)   # pour lire les Excel
+library(tseries)  # adf.test(), kpss.test()
+library(car)      # vif()
+
+# 1. Lecture des données
+# Remplacez les chemins par les vôtres, ou placez les fichiers dans votre working directory
+real_estate <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/real_estate_price.xlsx")
+exog_daily  <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/All_exog_data_daily.xlsx")
+```
+
+
+```{r}
+# 2. Mise en forme
+# Suppose que chaque table a une colonne "date" au format "YYYY-MM-DD"
+real_estate$Date <- as.Date(real_estate$Date)
+exog_daily$Date  <- as.Date(exog_daily$Date)
+
+# Fusion par date (inner join)
+data_full <- merge(real_estate, exog_daily, by = "Date")
+```
+
+
+```{r}
+# 3. Tests de stationnarité pour chaque série
+# Prépare deux data.frames vide pour stocker résultats
+adf_results  <- data.frame(series=character(), adf_stat=numeric(), adf_pvalue=numeric(), stringsAsFactors=FALSE)
+kpss_results <- data.frame(series=character(), kpss_stat=numeric(), kpss_pvalue=numeric(), stringsAsFactors=FALSE)
+
+# On exclut la colonne "date"
+all_series <- setdiff(names(data_full), "Date")
+
+for(col in all_series){
+  ts_vec <- data_full[[col]]
+  
+  # ADF : H0 = présence d'une racine unitaire (non-stationnaire)
+  adf <- tryCatch(adf.test(ts_vec), error=function(e) NULL)
+  
+  # KPSS : H0 = série stationnaire
+  kpss <- tryCatch(kpss.test(ts_vec, null="Level"), error=function(e) NULL)
+  
+  if(!is.null(adf)){
+    adf_results  <- rbind(adf_results, 
+                          data.frame(series=col, 
+                                     adf_stat=as.numeric(adf$statistic),
+                                     adf_pvalue=adf$p.value,
+                                     stringsAsFactors=FALSE))
+  }
+  if(!is.null(kpss)){
+    kpss_results <- rbind(kpss_results,
+                          data.frame(series=col,
+                                     kpss_stat=as.numeric(kpss$statistic),
+                                     kpss_pvalue=kpss$p.value,
+                                     stringsAsFactors=FALSE))
+  }
+}
+
+# Affichage des résultats
+cat("\n=== ADF Test Results ===\n")
+print(adf_results)
+cat("\n=== KPSS Test Results ===\n")
+print(kpss_results)
+
+# Interprétation rapide :
+# - ADF p-value < 0.05 ⇒ on rejette H0 (pas de racine unitaire) ⇒ série stationnaire.
+# - KPSS p-value < 0.05 ⇒ on rejette H0 (série stationnaire) ⇒ probabilité que la série soit NON-stationnaire.
+```
+
+
+```{r}
+# 4. Calcul des VIF sur le modèle price ~ exogènes
+# Identifiez le nom exact de votre variable prix, par exemple "price_m2"
+dep_var    <- "mean_price_square_meter"  # à remplacer par le nom réel dans real_estate
+exog_vars  <- setdiff(all_series, dep_var)
+
+# Construire dynamiquement la formule
+fmla <- as.formula(paste(dep_var, "~", paste(exog_vars, collapse=" + ")))
+lm_mod <- lm(fmla, data=data_full)
+
+# Calcul des VIF
+vif_vals <- vif(lm_mod)
+vif_df   <- data.frame(variable=names(vif_vals), VIF=as.numeric(vif_vals), row.names=NULL)
+
+cat("\n=== VIF Results ===\n")
+print(vif_df)
+
+# Interprétation des VIF :
+# - VIF < 5 : colinéarité acceptable
+# - VIF > 10 : forte colinéarité → envisager de retirer ou combiner des variables
+
+```
+
+Aucune de nos séries ne sont stationnaires, nous allons donc avancer dans nos recherches.
+Nous allons d'abord désaisonaliser les séries.
+```{r}
+# convertir en ts mensuel ou journalier selon votre fréquence
+# ici on part de data_full, avec date et colonnes de série
+library(forecast)
+# Pour la temperature d'abord
+ts_temp <- ts(data_full$Mean_2m_temperature, frequency=365)  # fréquence journalière
+# décomposition STL
+stl_temp <- stl(ts_temp, s.window="periodic")
+# série sans saison : le "remainder" + "trend"
+data_full$Temp_desaiss <- seasadj(stl_temp)
+
+# Pour les précipitations ensuite
+ts_prec <- ts(data_full$Mean_total_precipitation, frequency=365)  # fréquence journalière
+# décomposition STL
+stl_prec <- stl(ts_prec, s.window="periodic")
+# série sans saison : le "remainder" + "trend"
+data_full$prec_desaiss <- seasadj(stl_prec)
+
+# Pour le vent 
+ts_wind <- ts(data_full$Mean_10m_wind, frequency=365)  # fréquence journalière
+# décomposition STL
+stl_wind <- stl(ts_wind, s.window="periodic")
+# série sans saison : le "remainder" + "trend"
+data_full$wind_desaiss <- seasadj(stl_wind)
+
+# Pour le vent 
+ts_cape <- ts(data_full$Mean_cape, frequency=365)  # fréquence journalière
+# décomposition STL
+stl_cape <- stl(ts_cape, s.window="periodic")
+# série sans saison : le "remainder" + "trend"
+data_full$cape_desaiss <- seasadj(stl_cape)
+
+```
+
+Nous allons maintenant différencier les séries non stationnaires :
+```{r}
+data_diff1 <- data_full  # on garde toutes les lignes
+
+cols <- c("mean_price_square_meter", "Mean_10m_wind",
+          "Mean_total_precipitation", "Mean_2m_temperature",
+          "Mean_cape")
+
+# on crée, pour chaque série, un vecteur [NA, diff(...)]
+data_diff1[cols] <- lapply(data_full[cols], function(x) c(NA, diff(x)))
+
+# ensuite si vous ne voulez pas garder la première ligne à NA :
+data_diff1 <- data_diff1[-1, ]
+
+```
+
+Nous restestons la stationnarité : 
+```{r}
+check_stationarity <- function(vec){
+  adf <- adf.test(vec)
+  kpss <- kpss.test(vec, null="Level")
+  return(c(adf_p=adf$p.value, kpss_p=kpss$p.value))
+}
+
+sapply(data_diff1[cols], check_stationarity)
+# ou data_sdiff, ou data_logdiff selon celle que vous retenez
+```
+So we see there that all the ADF test are < 0.05 and that the KPSS are all equal 0.1 so we have stationary dataset
+
+Extraction of the data in CSV :
+```{r}
+#— write the result
+write.csv(data_diff1,
+          "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/Stat_data.csv",
+          row.names = FALSE)
+
+message("data well extracted")
+```
+

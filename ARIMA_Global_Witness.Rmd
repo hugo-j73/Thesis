@@ -1,0 +1,131 @@
+---
+title: "ARIMA"
+author: "H.JUGAND"
+date: "2025-05-04"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r}
+# Chargement des librairies requises
+library(readxl)
+library(forecast)
+library(ggplot2)
+library(dplyr)
+library(tseries)
+library(lmtest)
+
+# 1. Chargement et préparation des données
+price_data <- read_excel("C:/Users/hugoj/Downloads/mean_price_global.xlsx")
+ts_price <- ts(price_data$`Mean price per square meter`, start = c(2014, 1), frequency = 12)
+
+exog_data <- read_excel(
+  "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Database/exogenous variables data/Database_exogenous_variables.xlsx"
+) %>%
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date)
+
+# 2. Création de la matrice de variables exogènes alignées
+xreg_matrix <- ts(
+  cbind(
+    dwellings    = exog_data$`Number of dwellings allowed`,  
+    euribor      = exog_data$`Euribor 3 month`,
+    gdp          = exog_data$`GDP per capita (in million euro)`,
+    unemployment = exog_data$`Unemployement Rate`
+  ),
+  start = c(2014, 1), frequency = 12
+)
+
+# 3. Standardisation des variables exogènes
+xreg_scaled <- scale(xreg_matrix)
+
+# 4. Séparation train / test (derniers 12 mois en test)
+train_end   <- c(2023, 12)
+test_start  <- c(2024, 1)
+
+price_train <- window(ts_price, end = train_end)
+price_test  <- window(ts_price, start = test_start)
+
+xreg_train  <- window(xreg_scaled, end = train_end)
+xreg_test   <- window(xreg_scaled, start = test_start)
+
+# 5. Ajustement du modèle SARIMAX (auto.arima)
+sarimax_model <- auto.arima(
+  price_train,
+  seasonal      = TRUE,
+  xreg          = xreg_train,
+  stepwise      = FALSE,
+  approximation = FALSE,
+  trace         = TRUE
+)
+summary(sarimax_model)
+
+# 6. Diagnostics du modèle
+checkresiduals(sarimax_model)
+coeftest(sarimax_model)
+
+# 7. Validation sur l’échantillon test
+forecast_test <- forecast(
+  sarimax_model,
+  h    = length(price_test),
+  xreg = xreg_test
+)
+
+autoplot(forecast_test) +
+  autolayer(price_test, series = "Actual") +
+  ggtitle("Validation du modèle SARIMAX") +
+  theme_minimal()
+
+accuracy(forecast_test, price_test)
+
+# 8. Ajustement final et prévision sur 5 ans
+# Extraction des ordres ARIMA (p,d,q) et saisonniers (P,D,Q)
+order          <- sarimax_model$arma[c(1, 6, 2)]
+seasonal_order <- sarimax_model$arma[c(3, 7, 4)]
+
+final_model <- Arima(
+  ts_price,
+  order    = order,
+  seasonal = seasonal_order,
+  xreg     = xreg_scaled
+)
+
+# Préparation des exogènes pour 60 mois futurs (moyennes des 12 derniers mois)
+future_vals <- colMeans(tail(xreg_matrix, 12))
+future_xreg <- matrix(
+  rep(future_vals, each = 60),
+  nrow = 60, ncol = length(future_vals)
+)
+# Application de la même standardisation
+future_xreg <- scale(
+  future_xreg,
+  center = attr(xreg_scaled, "scaled:center"),
+  scale  = attr(xreg_scaled, "scaled:scale")
+)
+
+# Prévision sur 5 ans (60 mois)
+forecast_five_yr <- forecast(
+  final_model,
+  h    = 60,
+  xreg = future_xreg
+)
+
+autoplot(forecast_five_yr) +
+  ggtitle("Prévision SARIMAX sur 5 ans") +
+  xlab("Année") + ylab("Prix (€/m²)") +
+  theme_minimal()
+
+# Export des résultats dans un CSV
+forecast_results <- data.frame(
+  Date      = seq(as.Date("2024-01-01"), by = "month", length.out = 60),
+  Forecast  = as.numeric(forecast_five_yr$mean),
+  Lower_80  = as.numeric(forecast_five_yr$lower[,1]),
+  Upper_80  = as.numeric(forecast_five_yr$upper[,1])
+)
+write.csv(forecast_results, "sarimax_5yr_forecast.csv", row.names = FALSE)
+
+```
+
+
+

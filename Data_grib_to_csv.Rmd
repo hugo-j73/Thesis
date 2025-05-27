@@ -1,0 +1,88 @@
+---
+title: "Data_grib_to_csv"
+author: "H.JUGAND"
+date: "2025-05-05"
+output: word_document
+---
+
+# Tool : GRIB =\> CVS
+
+This is the tool I used in my thesis to read GRIB files. It transform climatic data extract from the climate data store (<https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels-monthly-means?tab=download>) in CSV document that are easier to manipulate with R, Python or Excel
+
+### 1. Importation of the data
+
+```{r}
+library(terra)
+
+# Load the GRIB file from your PC
+r <- terra::rast("Road_to_your_file/File_name.grib")   # Adapt the road and the file name for your GRIB file
+
+# Extract layer names and times
+layer_names <- names(r)
+time_info <- time(r)
+```
+
+### 2. Detection of the variables
+
+```{r}
+layer_names <- names(r)     
+time_info   <- time(r)      
+head(layer_names)
+head(time_info)
+```
+
+### 3. Cleaning of the titles
+
+```{r}
+# Based on the previous results, remove the non necessary text on the titles. Here some examples :
+# 1) Remove all of the above, including the « ;  »
+clean_names <- sub("^.*;\\s+", "", layer_names)
+
+# 2) Remove the parenthesis « (absolute) »  
+clean_names <- gsub("\\s*\\(absolute\\)", "", clean_names)
+
+# 3) Remove the units in square brackets « [C] » and « [m] »  
+clean_names <- gsub("\\s*\\[.*\\]", "", clean_names)
+
+# 4) We trim the superfluous spaces at the beginning/end   
+clean_names <- trimws(clean_names)
+
+# 5) Check that the titles are clean
+unique(clean_names)
+```
+
+### 4. Cleaning of the database
+
+```{r}
+# Identify the index
+ex_one_idx <- which(clean_names == "Example 1")   # Change "Example 1" by the title name of a variable
+ex_two_idx <- which(clean_names == "Example 2")   # Change "Example 2" by the title name of a variable
+
+# Treat each variables to have the monthly means
+get_monthly_means <- function(index_vector, time_vector, name_prefix) {
+  r_var <- r[[index_vector]]
+  months <- format(time_vector[index_vector], "%Y-%m")
+  terra::tapp(r_var, index = months, fun = mean, filename = paste0(name_prefix, "_monthly_mean.tif"), overwrite = TRUE)
+}
+
+# Apply the previous function to each variable previously detected
+ex_one_monthly <- get_monthly_means(ex_one_idx, time_info, "Example 1") # Change "Example 1" by the title name of a variable
+ex_two_monthly <- get_monthly_means(ex_two_idx, time_info, "Example 2") # Change "Example 2" by the title name of a variable
+```
+
+```{r}
+# Last treatment of the data to have a readable data on CSV
+df_ex_one <- as.data.frame(ex_one_monthly, xy = TRUE, na.rm = TRUE)
+df_ex_two <- as.data.frame(ex_two_monthly, xy = TRUE, na.rm = TRUE)
+
+names(df_ex_one)[-(1:2)] <- paste0("one_", names(ex_one_monthly))
+names(df_ex_two)[-(1:2)] <- paste0("two_", names(ex_two_monthly))
+```
+
+### 5. Export in CSV
+
+```{r}
+# export in CSV
+write.csv(df_ex_one, "Road_to_your_file/File_one_monthly_means.csv", row.names = FALSE) # Adapt the road and the file name for your GRIB file
+write.csv(df_ex_two, "Road_to_your_file/File_two_monthly_means.csv", row.names = FALSE) # Adapt the road and the file name for your GRIB file
+```

@@ -1,0 +1,66 @@
+---
+title: "Lag_correl"
+author: "H.JUGAND"
+date: "2025-05-08"
+output: word_document
+---
+
+```{r}
+# 1. Installer/charger les packages nécessaires
+library(readxl)
+library(dplyr)
+
+# 2. Charger les données
+# Remplacez le chemin par le vôtre si besoin
+df <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/Stat_data.xlsx")
+```
+
+
+```{r}
+# 3. Paramétrage
+target_var <- "mean_price_square_meter"
+other_vars <- setdiff(names(df), target_var)
+lags <- 0:3               # lags désirés
+```
+
+
+```{r}
+# 4. Fonction utilitaire pour extraire la ccf à un lag donné
+get_ccf_at_lag <- function(x, y, lag) {
+  cc <- ccf(x, y, lag.max = max(lags), plot = FALSE)
+  # on sélectionne l’élément dont cc$lag == lag
+  cc$acf[ which(cc$lag == lag) ]
+}
+```
+
+
+```{r}
+# 5. Boucle principale : construction d’un data.frame "résultats"
+results <- expand.grid(variable = other_vars, lag = lags, 
+                       stringsAsFactors = FALSE) %>%
+  rowwise() %>%
+  mutate(
+    ccf = get_ccf_at_lag(
+      df[[target_var]],
+      df[[variable]],
+      lag
+    )
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+# 6. Afficher le tableau final
+print(results)
+```
+
+```{r}
+#— write the result
+write.csv(results,
+          "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/Lag_Cor_result.csv",
+          row.names = FALSE)
+
+message("data well extracted")
+```
+

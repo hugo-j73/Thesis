@@ -1,0 +1,719 @@
+---
+title: "ARIMAX_v2"
+author: "H.JUGAND"
+date: "2025-05-09"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+# 1. Importation des librairies
+library(readxl)
+library(forecast)
+library(lubridate)
+
+df  <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMAX_global/V2/Data.xlsx")
+#View(global_data)
+#chartSeries(global_data)
+df$Date <- as.Date(df$Date, format = "%d/%m/%Y")
+# Supposons une fréquence mensuelle
+ts_price <- ts(df$Mean_price_per_square_meter, start = c(year(min(df$Date)), month(min(df$Date))), frequency = 12)
+ts_exo   <- ts(df[, c("Number_of_dwellings_allowed","Euribor_3_month","GDP_per_capita","Population","Unemployment_Rate")],
+               start = start(ts_price), frequency = 12)
+```
+
+Stationarity test
+
+```{r}
+library(tseries)
+
+# 1) Préparer la liste des séries
+# --------------------------------
+# On regroupe ts_price et les colonnes de ts_exo dans une même liste,
+# avec des noms explicites
+series_list <- c(
+  prix = list(ts_price), 
+  as.list(ts_exo)
+)
+names(series_list)[-1] <- colnames(ts_exo)
+
+# 2) Calculer les tests pour chaque série
+# ----------------------------------------
+res <- lapply(names(series_list), function(nom) {
+  x   <- series_list[[nom]]
+  adf <- adf.test(x)
+  kpss <- kpss.test(x)
+  data.frame(
+    series     = nom,
+    adf_stat   = as.numeric(adf$statistic),
+    adf_p.value= adf$p.value,
+    kpss_stat  = as.numeric(kpss$statistic),
+    kpss_p.value= kpss$p.value,
+    stringsAsFactors = FALSE
+  )
+})
+
+# 3) Concaténer en un seul tableau
+# ---------------------------------
+tab_tests <- do.call(rbind, res)
+
+# 4) (Optionnel) Ajouter une conclusion simple
+# --------------------------------------------
+tab_tests$conclusion <- with(tab_tests,
+  ifelse(adf_p.value < .05 & kpss_p.value > .05,
+         "Stationnaire",
+         ifelse(adf_p.value > .05 & kpss_p.value < .05,
+                "Non-stationnaire",
+                "Inconcluant"))
+)
+
+# 5) Afficher le tableau
+print(tab_tests)
+```
+
+```{r}
+library(forecast)
+library(ggplot2)
+
+# Décomposition additive ou STL
+stl_price <- stl(ts_price, s.window = "periodic")
+autoplot(stl_price) + ggtitle("Décomposition STL du prix du m²")
+
+# Pour chaque exogène
+lapply(as.data.frame(ts_exo), function(x) {
+  fit <- stl(ts(x, frequency = frequency(ts_price)), s.window="periodic")
+  autoplot(fit) + ggtitle(paste("STL de", deparse(substitute(x))))
+})
+```
+
+Calcul de l'ajustement de la saisonalité et de la stationnarité :
+```{r}
+d <- ndiffs(ts_price)       # ordinaire (pour la tendance)
+D <- nsdiffs(ts_price)      # saisonnière (lag 12)
+
+cat("→ Différence(s) ordinaire(s) à appliquer (d) :", d, "\n")
+cat("→ Différence(s) saisonnière(s) à appliquer (D):", D, "\n")
+```
+
+```{r}
+exo_df <- as.data.frame(ts_exo)
+ordinaire <- sapply(exo_df, function(col) {
+  ndiffs(ts(col, frequency = frequency(ts_price)))
+})
+saisons <- sapply(exo_df, function(col) {
+  nsdiffs(ts(col, frequency = frequency(ts_price)))
+})
+"Number or ordinary differences to have a stationnary data"
+ordinaire
+"Number or seasonal differences to have a stationnary data"
+saisons
+
+```
+
+```{r}
+library(forecast)
+library(car)
+
+# 1) Nombre de différences à appliquer
+d_price <- ndiffs(ts_price)
+D_price <- nsdiffs(ts_price)
+
+d_exo   <- ordinaire    # vecteur nommé, issu de votre apply(ndiffs)
+D_exo   <- saisons      # vecteur nommé, issu de votre apply(nsdiffs)
+
+# 2) Transformer la série prix
+price_stat <- ts_price
+if(d_price   > 0) price_stat <- diff(price_stat, differences = d_price)
+if(D_price   > 0) price_stat <- diff(price_stat, lag = frequency(ts_price), differences = D_price)
+
+# 3) Transformer chacune des exogènes
+exo_df <- as.data.frame(ts_exo)
+exo_stat_list <- Map(function(x, d, D) {
+  y <- x
+  if(d > 0) y <- diff(y, differences = d)
+  if(D > 0) y <- diff(y, lag = frequency(ts_price), differences = D)
+  return(y)
+}, exo_df, d_exo, D_exo)
+
+exo_stat <- do.call(cbind, exo_stat_list)
+colnames(exo_stat) <- names(exo_df)
+
+# 4) Rassembler dans un data.frame (en supprimant les NA du début)
+start_na <- max(d_price + D_price*frequency(ts_price), max(d_exo + D_exo*frequency(ts_price)))
+price_stat   <- window(price_stat, start = time(price_stat)[start_na+1])
+exo_stat     <- window(exo_stat,   start = time(exo_stat)[start_na+1])
+df_stat      <- data.frame(prix = as.numeric(price_stat), exo_stat)
+
+```
+
+We re-test the stationnarity of our variables
+```{r}
+# 1. Charger le package de tests
+library(tseries)
+
+# 2. Recréer un objet 'ts' pour exo_stat (au cas où il ne le serait plus)
+#    On utilise le même 'start' et la même fréquence que price_stat
+exo_stat_ts <- ts(exo_stat,
+                  start     = start(price_stat),
+                  frequency = frequency(price_stat))
+
+# 3. Mettre toutes les séries dans une liste nommée
+series_stat_list <- c(
+  prix = list(price_stat),
+  as.list(as.data.frame(exo_stat_ts))
+)
+names(series_stat_list)[-1] <- colnames(exo_stat_ts)
+
+# 4. Boucler sur chaque série pour calculer adf.test et kpss.test
+res_stat <- lapply(names(series_stat_list), function(nm) {
+  x    <- series_stat_list[[nm]]
+  adf  <- adf.test(x)
+  kpss <- kpss.test(x)
+  data.frame(
+    series       = nm,
+    adf_stat     = as.numeric(adf$statistic),
+    adf_p.value  = adf$p.value,
+    kpss_stat    = as.numeric(kpss$statistic),
+    kpss_p.value = kpss$p.value,
+    stringsAsFactors = FALSE
+  )
+})
+
+# 5. Concaténer et ajouter une conclusion simple
+tab_stat <- do.call(rbind, res_stat)
+tab_stat$conclusion <- with(tab_stat,
+  ifelse(adf_p.value < .05 & kpss_p.value > .05, "Stationnaire",
+  ifelse(adf_p.value > .05 & kpss_p.value < .05, "Non-stationnaire",
+         "Inconcluant"))
+)
+
+# 6. Afficher le résultat
+print(tab_stat)
+```
+The population variable remain non stationnary. We will retreat this series.
+We first look for the number of differences we need to apply :
+```{r}
+library(forecast)
+
+# reconstituez votre ts population
+pop_ts <- ts(df$Population,
+             start     = start(ts_price),
+             frequency = frequency(ts_price))
+
+# nombre de différences “optimales” au test KPSS
+d_pop <- ndiffs(pop_ts)  
+d_pop
+```
+It seems that we need to apply one more differenciation :
+```{r}
+pop_diff1 <- diff(pop_ts, differences = 1)
+
+# retest
+adf.test(pop_diff1)
+kpss.test(pop_diff1)
+```
+Our serie is now stationnary, we can add it to th dataframe with the rest of our data.
+
+```{r}
+# Reconstituer la variable Population après traitement (différence supplémentaire)
+# Tronquer pop_diff1 pour qu'il corresponde exactement à la taille de la colonne à remplacer
+exo_stat[,"Population"] <- tail(as.numeric(pop_diff1), nrow(exo_stat))
+
+# Mettre à jour l'objet ts de variables explicatives
+exo_ts_final <- ts(exo_stat, start = start(price_stat), frequency = frequency(price_stat))
+```
+
+
+We realise now an ARIMA for each exogenous variable, it will be integrated to our ARIMAX model in a second time.
+```{r}
+# Number of dwellign allowed
+fit_endo_dw <- auto.arima(exo_ts_final[,"Number_of_dwellings_allowed"])
+forecast_endo_dw <- forecast(fit_endo_dw, h = 60)
+
+autoplot(forecast_endo_dw) + ggtitle("ARIMA prevision - Number_of_dwellings_allowed")
+
+# Stocker les prévisions
+dwelling_future <- as.numeric(forecast_endo_dw$mean)
+
+#______________________________________________________________________
+# Euribor_3_month
+fit_endo_eur <- auto.arima(exo_ts_final[,"Euribor_3_month"])
+forecast_endo_eur <- forecast(fit_endo_eur, h = 60)
+
+autoplot(forecast_endo_eur) + ggtitle("ARIMA prevision - Euribor_3_month")
+
+# Stocker les prévisions
+euribor_future <- as.numeric(forecast_endo_eur$mean)
+
+#______________________________________________________________________
+# GDP_per_capita
+fit_endo_gdp <- auto.arima(exo_ts_final[,"GDP_per_capita"])
+forecast_endo_gdp <- forecast(fit_endo_gdp, h = 60)
+
+autoplot(forecast_endo_gdp) + ggtitle("ARIMA prevision - GDP_per_capita")
+
+# Stocker les prévisions
+gdp_future <- as.numeric(forecast_endo_gdp$mean)
+
+#______________________________________________________________________
+# GDP_per_capita
+fit_endo_pop <- auto.arima(exo_ts_final[,"Population"])
+forecast_endo_pop <- forecast(fit_endo_pop, h = 60)
+
+autoplot(forecast_endo_pop) + ggtitle("ARIMA prevision - Population")
+
+# Stocker les prévisions
+pop_future <- as.numeric(forecast_endo_pop$mean)
+
+#______________________________________________________________________
+# GDP_per_capita
+fit_endo_un <- auto.arima(exo_ts_final[,"Unemployment_Rate"])
+forecast_endo_un <- forecast(fit_endo_un, h = 60)
+
+autoplot(forecast_endo_un) + ggtitle("ARIMA prevision - Unemployment_Rate")
+
+# Stocker les prévisions
+un_future <- as.numeric(forecast_endo_un$mean)
+```
+
+```{r}
+# Répéter pour chaque variable...
+exo_forecasts <- data.frame(
+  Number_of_dwellings_allowed = forecast(auto.arima(exo_ts_final[,"Number_of_dwellings_allowed"]), h = 60)$mean,
+  Euribor_3_month = forecast(auto.arima(exo_ts_final[,"Euribor_3_month"]), h = 60)$mean,
+  GDP_per_capita = forecast(auto.arima(exo_ts_final[,"GDP_per_capita"]), h = 60)$mean,
+  Population = forecast(auto.arima(exo_ts_final[,"Population"]), h = 60)$mean,
+  Unemployment_Rate = forecast(auto.arima(exo_ts_final[,"Unemployment_Rate"]), h = 60)$mean
+)
+
+# Convertir en matrice pour l'ARIMAX
+exo_future <- as.matrix(exo_forecasts)
+```
+
+ARIMAX :
+```{r}
+fit_arimax <- auto.arima(price_stat, xreg = exo_ts_final, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+forecast_arimax <- forecast(fit_arimax, xreg = exo_future, h = 60)
+autoplot(forecast_arimax) + ggtitle("Prévision ARIMAX sur 60 mois")
+
+```
+
+```{r}
+# exemple pour deux exogènes : exo1 et exo2
+fit_exo1 <- auto.arima(ts_exo[,"Number_of_dwellings_allowed"])
+fit_exo2 <- auto.arima(ts_exo[,"Euribor_3_month"])
+fit_exo3 <- auto.arima(ts_exo[,"GDP_per_capita"])
+fit_exo4 <- auto.arima(ts_exo[,"Population"])
+fit_exo5 <- auto.arima(ts_exo[,"Unemployment_Rate"])
+fc_exo1  <- forecast(fit_exo1, h = 60)
+fc_exo2  <- forecast(fit_exo2, h = 60)
+fc_exo3  <- forecast(fit_exo3, h = 60)
+fc_exo4  <- forecast(fit_exo4, h = 60)
+fc_exo5  <- forecast(fit_exo5, h = 60)
+
+# on récupère la moyenne prédite (en niveaux)
+future_exo <- cbind(
+  exo1 = as.numeric(fc_exo1$mean),
+  exo2 = as.numeric(fc_exo2$mean),
+  exo3 = as.numeric(fc_exo3$mean),
+  exo4 = as.numeric(fc_exo4$mean),
+  exo5 = as.numeric(fc_exo5$mean)
+)
+```
+
+
+```{r}
+library(forecast)
+library(ggplot2)
+
+# 1) Forecast de chaque exogène (en niveaux) et mise en forme
+exo_names <- colnames(ts_exo)
+exo_future_list <- lapply(as.list(as.data.frame(ts_exo)), function(x) {
+  forecast(auto.arima(x), h = 60)$mean
+})
+exo_future <- do.call(cbind, exo_future_list)
+colnames(exo_future) <- exo_names
+# exo_future est donc une matrice 60×5 nommée exactement comme ts_exo
+
+# 2) Ajustement ARIMAX sur la série en niveaux
+#    On peut forcer d=1 et max.p=2,max.q=2 pour retrouver un (2,1,2) si on le souhaite
+fit_arimax <- auto.arima(
+  ts_price,
+  xreg         = as.matrix(ts_exo),
+  d            = 1,            # on impose un différenciation
+  max.p        = 2,
+  max.q        = 2,
+  seasonal     = FALSE,
+  stepwise     = FALSE,
+  approximation= FALSE,
+  allowdrift   = TRUE         # on autorise un drift (constante dans la partie différenciée)
+)
+
+summary(fit_arimax)
+# -> vous devez voir p=2, d=1, q=2 et un drift non nul dans la partie différenciée
+
+# 3) Prévision ARIMAX sur 60 mois avec les exogènes projetés
+fc_arimax <- forecast(
+  fit_arimax,
+  xreg = as.matrix(exo_future),
+  h    = 60
+)
+
+# 4) Tracé en niveaux
+autoplot(fc_arimax) +
+  autolayer(ts_price, series = "Données observées") +
+  ggtitle("Prévision ARIMAX(2,1,2)+drift avec exogènes") +
+  labs(x = "Temps", y = "Prix (€/m²)")
+
+```
+
+Backtesting :
+```{r}
+library(forecast)
+library(ggplot2)
+
+# 1) Données et paramètres
+y         <- ts_price                    # votre ts en niveaux
+X         <- as.matrix(ts_exo)           # vos exogènes en niveaux
+p <- 2; d <- 1; q <- 2                    # ordre ARIMA(2,1,2)
+test.size <- 60
+n         <- length(y)
+n.train0  <- n - test.size               # taille initiale entrainement
+
+# 2) Vecteurs d’erreur
+err_a     <- rep(NA_real_, test.size)    # ARIMA seul
+err_ax    <- rep(NA_real_, test.size)    # ARIMAX
+
+# 3) Rolling-origin
+for(i in seq_len(test.size)) {
+  end.train <- n.train0 + i - 1
+  train.len <- end.train
+  
+  # si trop peu de points pour un (2,1,2) + 1 drift + k exo, on skip
+  if(train.len < (p + q + 1) + ncol(X)) next
+  
+  y.tr  <- window(y, end = time(y)[end.train])
+  X.tr  <- X[1:end.train, , drop = FALSE]
+  X.new <- matrix(X[end.train + 1, ], nrow = 1)
+  
+  # ARIMA(2,1,2)+drift
+  fit_a <- tryCatch(
+    Arima(y.tr, order = c(p,d,q), include.drift = TRUE),
+    error = function(e) NULL
+  )
+  
+  # ARIMAX(2,1,2)+drift
+  fit_ax <- tryCatch(
+    Arima(y.tr, order = c(p,d,q), include.drift = TRUE, xreg = X.tr),
+    error = function(e) NULL
+  )
+  
+  obs <- y[end.train + 1]
+  
+  if(!is.null(fit_a)) {
+    f1        <- forecast(fit_a,  h = 1)
+    err_a[i]  <- as.numeric(f1$mean - obs)
+  }
+  if(!is.null(fit_ax)) {
+    f2         <- forecast(fit_ax, h = 1, xreg = X.new)
+    err_ax[i]  <- as.numeric(f2$mean - obs)
+  }
+}
+
+# 4) On ne garde que les "pas" réussis des deux modèles
+ok   <- which(!is.na(err_a) & !is.na(err_ax))
+err_a2  <- err_a[ok]
+err_ax2 <- err_ax[ok]
+
+# 5) Metrics
+mae_a     <- mean(abs(err_a2))
+rmse_a    <- sqrt(mean(err_a2^2))
+mae_ax    <- mean(abs(err_ax2))
+rmse_ax   <- sqrt(mean(err_ax2^2))
+
+cat("ARIMA   — MAE =", round(mae_a,1),
+    " RMSE =", round(rmse_a,1), "\n")
+cat("ARIMAX  — MAE =", round(mae_ax,1),
+    " RMSE =", round(rmse_ax,1), "\n")
+
+# 6) Tracé des erreurs
+df <- data.frame(
+  t      = ok,
+  ARIMA  = err_a2,
+  ARIMAX = err_ax2
+)
+library(reshape2)
+dfm <- melt(df, id = "t")
+
+ggplot(dfm, aes(x = t, y = value, col = variable)) +
+  geom_line() +
+  labs(
+    title = "Back-testing one-step",
+    x     = "Mois (index dans la fenêtre test)",
+    y     = "Forecast – Réel"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(forecast)
+library(ggplot2)
+
+# --- 1) Prévision des exogènes en niveaux sur 60 mois -------------
+# (on suppose ts_exo = série multivariée ts (n × k))
+
+exo_names <- colnames(ts_exo)
+# pour chaque colonne, on ajuste un ARIMA et on extrait la mean prédite
+exo_future_list <- lapply(
+  as.data.frame(ts_exo),
+  function(col) forecast(auto.arima(col), h = 60)$mean
+)
+# reconstituer la matrice (60 × k) avec les bons noms
+exo_future <- do.call(cbind, exo_future_list)
+colnames(exo_future) <- exo_names
+
+
+# --- 2) Ajustement et forecast ARIMA seul -------------------------
+fit_arima  <- auto.arima(ts_price,
+                         seasonal     = FALSE,
+                         stepwise     = FALSE,
+                         approximation= FALSE)
+fc_arima   <- forecast(fit_arima, h = 60)
+
+
+# --- 3) Ajustement et forecast ARIMAX -----------------------------
+fit_arimax <- auto.arima(ts_price,
+                         xreg         = as.matrix(ts_exo),
+                         d            = 1,
+                         max.p        = 2,
+                         max.q        = 2,
+                         seasonal     = FALSE,
+                         stepwise     = FALSE,
+                         approximation= FALSE,
+                         allowdrift   = TRUE)
+fc_arimax  <- forecast(fit_arimax,
+                       xreg = as.matrix(exo_future),
+                       h    = 60)
+
+
+# --- 4) Tracé comparatif -----------------------------------------
+autoplot(ts_price) +
+  # ARIMA nu
+  autolayer(fc_arima,  series = "ARIMA seul", PI = TRUE) +
+  # ARIMAX
+  autolayer(fc_arimax, series = "ARIMAX",     PI = TRUE) +
+  scale_colour_manual(
+    values = c("ARIMA seul" = "darkred", "ARIMAX" = "steelblue")
+  ) +
+  ggtitle("Prévision 60 mois : ARIMA vs ARIMAX") +
+  labs(x = "Temps", y = "Prix (€/m²)", colour = "Modèle") +
+  theme_minimal()
+```
+Test pour être certain que le fait que l'arimax ait une prévision négative ne soit pas une erreur
+```{r}
+summary(fit_arimax)
+
+# vous pouvez tracer chacun ainsi :
+autoplot(fc_exo1) + autolayer(fc_exo2) + autolayer(fc_exo3) + autolayer(fc_exo4) + autolayer(fc_exo5)
+
+
+```
+
+Number of dwelling allowed a buggé, ce qui donne une mauvaise prévision de l'ARIMAX, je viens donc le ré-estimer :
+```{r}
+fit_ndwa <- auto.arima(ts_exo[,"Number_of_dwellings_allowed"],
+                       d            = 1,   # une seule diff
+                       D            = 1,   # et saisonnière si besoin
+                       max.p        = 1,   
+                       max.q        = 1,
+                       max.P        = 1,
+                       max.Q        = 0,
+                       seasonal     = TRUE,
+                       stepwise     = FALSE,
+                       approximation= FALSE,
+                       allowdrift   = TRUE)
+fc_ndwa <- forecast(fit_ndwa, h = 60)
+autoplot(fc_ndwa) + ggtitle("Permis de construire : prévision corrigée")
+
+```
+
+```{r}
+# 0) Rappel : regardons d’abord un résumé de ts_exo
+summary(as.data.frame(ts_exo))
+#   Number_of_dwellings_allowed  Euribor_3_month  GDP_per_capita   Population   Unemployment_Rate
+# Min.   :   2000              Min.   : 0.10     Min.   : 20000   Min.   : 1e6  Min.   : 3.0
+# 1st Qu.:  50000              1st Qu.: 0.50     1st Qu.: 25000   1st Qu.: 1.2e6 1st Qu.: 7.0
+# Median : 100000              Median : 1.00     Median : 30000   Median : 1.3e6 Median : 9.0
+# Mean   : 110000              Mean   : 1.50     Mean   : 32000   Mean   : 1.4e6 Mean   : 10.0
+# 3rd Qu.: 150000              3rd Qu.: 2.00     3rd Qu.: 35000   3rd Qu.: 1.5e6 3rd Qu.: 12.0
+# Max.   : 200000              Max.   : 3.00     Max.   : 40000   Max.   : 1.6e6 Max.   : 15.0
+
+# 1) Recoder chaque variable dans une unité “raisonnable” :
+ts_exo_calé <- ts_exo
+ts_exo_calé[,"Euribor_3_month"]           <- ts_exo[,"Euribor_3_month"] / 100
+ts_exo_calé[,"Unemployment_Rate"]         <- ts_exo[,"Unemployment_Rate"] / 100
+ts_exo_calé[,"GDP_per_capita"]            <- ts_exo[,"GDP_per_capita"] / 1000   # en milliers d’€
+ts_exo_calé[,"Population"]                <- ts_exo[,"Population"] / 1e6      # en millions d’habitants
+# Number_of_dwellings_allowed reste en “permis / mois”
+
+# 2) Vérifions le nouveau résumé
+summary(as.data.frame(ts_exo_calé))
+#   Number_of_dwellings_allowed Euribor_3_month   GDP_per_capita Population   Unemployment_Rate
+# Min.   :   2000              Min.   :0.0010     Min.  : 20.00   Min.  :1.0    Min.  :0.03
+# 1st Qu.:  50000              1st Qu.:0.0050     1st Qu.: 25.00   1st Qu.:1.2    1st Qu.:0.07
+# Median : 100000              Median :0.0100     Median : 30.00   Median :1.3    Median :0.09
+# Mean   : 110000              Mean   :0.0150     Mean   : 32.00   Mean   :1.4    Mean   :0.10
+# 3rd Qu.: 150000              3rd Qu.:0.0200     3rd Qu.: 35.00   3rd Qu.:1.5    3rd Qu.:0.12
+# Max.   : 200000              Max.   :0.0300     Max.   : 40.00   Max.   :1.6    Max.   :0.15
+
+# 3) Générer les prévisions futures sur ces nouvelles échelles
+exo_names <- colnames(ts_exo_calé)
+exo_future_list <- lapply(
+  as.data.frame(ts_exo_calé),
+  function(col) {
+    fit <- auto.arima(col, seasonal=FALSE, stepwise=FALSE, approximation=FALSE)
+    forecast(fit, h = 60)$mean
+  }
+)
+exo_future_calé <- do.call(cbind, exo_future_list)
+colnames(exo_future_calé) <- exo_names
+
+# 4) Vous pouvez tracer pour vérifier :
+library(ggplot2)
+exo_future_ts <- ts(exo_future_calé,
+                    start = c(end(ts_exo_calé)[1] + (end(ts_exo_calé)[2] < frequency(ts_exo_calé)),
+                              if(end(ts_exo_calé)[2] < frequency(ts_exo_calé)) 
+                                end(ts_exo_calé)[2] + 1 else 1),
+                    frequency = frequency(ts_exo_calé))
+autoplot(exo_future_ts) +
+  ggtitle("Prévisions des exogènes (échelles recalées)") +
+  xlab("Année") + ylab("Valeur recodée")
+
+library(forecast)
+library(car)       # pour vif()
+library(ggplot2)
+
+# 1) Matrice de corrélation
+cor_exo <- cor(ts_exo_calé)
+print(cor_exo)
+
+# 2) VIF sur une régression linéaire « levels » pour détecter la colinéarité
+df <- data.frame(
+  y  = as.numeric(ts_price),
+  as.data.frame(ts_exo_calé)
+)
+vifs <- vif(lm(y ~ ., data = df))
+print(vifs)
+
+# 3) On retire les exogènes avec VIF > 10 (seuil classique)
+bad   <- names(vifs)[vifs > 10]
+good  <- setdiff(colnames(ts_exo_calé), bad)
+cat("On supprime :", bad, "\n")
+
+ts_exo_ok        <- ts_exo_calé[, good, drop = FALSE]
+exo_future_ok    <- exo_future_calé[, good, drop = FALSE]
+
+# 4) Refit ARIMAX avec la méthode CSS (ne calcule pas le Hessian)
+fit_arimax_ok <- Arima(
+  ts_price,
+  order         = c(2,1,2),
+  include.drift = TRUE,
+  xreg          = as.matrix(ts_exo_ok),
+  method        = "CSS"
+)
+summary(fit_arimax_ok) 
+
+# 5) Forecast et tracé
+fc_ok <- forecast(
+  fit_arimax_ok,
+  xreg = as.matrix(exo_future_ok),
+  h    = 60
+)
+
+autoplot(ts_price, size = 0.5) +
+  autolayer(fc_ok, series = "ARIMAX (exog réduits)") +
+  ggtitle("Prévision ARIMAX après retrait des exo collinéaires") +
+  labs(x = "Temps", y = "Prix (€/m²)")
+```
+Le modèle ARIMAX sors enfin des valeurs coéhrentes !!!!
+
+```{r}
+# (635-639) — ajustement du modèle
+fit_arimax <- auto.arima(
+  ts_price,
+  xreg         = as.matrix(ts_exo),
+  d            = 1,
+  max.p        = 2,
+  max.q        = 2,
+  seasonal     = FALSE,
+  stepwise     = FALSE,
+  approximation= FALSE,
+  allowdrift   = TRUE
+)
+
+# ── 1. Lire l’AICc directement ──────────────────────────────────────
+AICc(fit_arimax)      # fonction du package {forecast}
+
+```
+
+
+
+Il faudra comparer les MAE et RMSE avec notre ARIMA de base pour s'assurer que ce modèle ci apporte bien quelque chose mais normalement oui !
+Exportons les données à présent :
+```{r}
+# --- Supposons que votre forecast s'appelle 'fc_ok' ----------------
+
+# 1) Construire un data.frame
+fc_df <- data.frame(
+  Date      = time(fc_ok$mean),             # série temporelle (Numérique)
+  Forecast  = as.numeric(fc_ok$mean),       # moyenne prédite
+  Lo80      = fc_ok$lower[, "80%"],         # borne inférieure 80%
+  Hi80      = fc_ok$upper[, "80%"],         # borne supérieure 80%
+  Lo95      = fc_ok$lower[, "95%"],         # borne inférieure 95%
+  Hi95      = fc_ok$upper[, "95%"]          # borne supérieure 95%
+)
+
+# 2) Écrire en CSV (dans le working directory)
+write.csv(
+  fc_df,
+  file       = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMAX_global/V2/forecast_arimax_V2.csv",
+  row.names  = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# 3) Message à l’écran
+cat("Les prévisions ont été sauvegardées dans le fichier 'forecast_arimax.csv'\n")
+
+```
+export du graphique ARIMAX :
+```{r}
+library(ggplot2)
+
+# 1) Refaire le plot dans un objet
+p_arimax <- autoplot(ts_price, size = 0.5) +
+  autolayer(fc_ok, series = "ARIMAX (exog réduits)") +
+  ggtitle("ARIMAX(2,1,2)+drift prevision — with exogenous variables") +
+  labs(x = "Temps", y = "Prix (€/m²)", colour = "Séries") +
+  theme_minimal()
+
+# 2) Afficher à l’écran
+print(p_arimax)
+
+# 3) Sauvegarder en PNG dans votre working directory
+ggsave(
+  filename = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMAX_global/V2/projection_ARIMAX.png",
+  plot     = p_arimax,
+  width    = 10,     # en pouces
+  height   = 6,      # en pouces
+  dpi      = 300     # résolution
+)
+
+cat("Graphiques exportés : 'projection_ARIMAX.png'\n")
+```
+
+```{r}
+show(vifs)
+```
+

@@ -1,0 +1,604 @@
+---
+title: "Weather_VaR"
+author: "H.JUGAND"
+date: "2025-05-10"
+output: word_document
+---
+
+```{r}
+# Weather VaR analysis in R
+# ============================================
+# 1. Chargement et préparation des données
+# --------------------------------------------
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(tseries)
+library(urca)
+library(dynlm)
+library(boot)
+```
+
+
+```{r}
+# 1.1 Charger
+exog <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/All_exog_data_daily.xlsx") %>%
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date)
+
+price <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/real_estate_price.xlsx") %>%
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date)
+```
+
+
+```{r}
+# 1.2 Merge et imputation des dates manquantes
+data_full <- full_join(exog, price, by = "Date") %>%
+  complete(Date = seq(min(Date), max(Date), by = "day")) %>%
+  arrange(Date)
+```
+
+
+```{r}
+# 1.3 Imputation (forward/backward fill)
+data_full <- data_full %>%
+  fill(everything(), .direction = "downup")
+
+# 1.4 Mise à l’échelle des variables exogènes
+exog_vars <- c("Mean_10m_wind", "Mean_total_precipitation",
+               "Mean_2m_temperature", "Mean_cape")
+data_full[exog_vars] <- scale(data_full[exog_vars])
+```
+
+
+```{r}
+# 2. Transformation de la variable cible
+# --------------------------------------
+# On prépare trois séries : niveaux, variations (%) et log-returns
+# Utiliser lag() et opérations élémentaires pour conserver la même longueur de série
+data_full <- data_full %>%
+  mutate(
+    level   = mean_price_square_meter,
+    ret_pct = (level / lag(level) - 1) * 100,
+    ret_log = log(level) - log(lag(level))
+  )
+
+# Tests de stationnarité pour choisir la meilleure série
+adf_level <- ur.df(data_full$level, type = "trend",  selectlags = "AIC")
+adf_pct   <- ur.df(na.omit(data_full$ret_pct),  type = "drift",  selectlags = "AIC")
+adf_log   <- ur.df(na.omit(data_full$ret_log),  type = "drift",  selectlags = "AIC")
+summary(adf_level)
+summary(adf_pct)
+summary(adf_log)
+
+# Choisir la série dont le test ADF rejette le plus fortement H0 de racine unitaire
+# Par exemple :
+# series <- if(adf_log@teststat[1] < adf_log@cval[1, "5% "]) "ret_log" else "ret_pct"
+```
+
+Nous retenons ret_log, c'est à dire les log_return.
+
+
+```{r}
+# On part de data_full contenant :
+# - data_full$ret_log calculé
+# - les variables exogènes initiales dans `exog_vars`
+
+library(dynlm)
+library(boot)
+library(FinTS)
+
+# Redéfinir ici le nom des variables exogènes utilisées
+exog_vars <- c("Mean_10m_wind", "Mean_total_precipitation",
+               "Mean_2m_temperature", "Mean_cape")
+
+# 3. Estimation du modèle ADL(p, q)
+series <- "ret_log"
+p <- 1; q <- 0
+
+# 3.1. Terme de lags de la variable cible
+lags_y_list <- paste0("L(", series, ",", 1:p, ")")
+lags_y <- paste(lags_y_list, collapse = " + ")
+
+# 3.2. Termes exogènes pour chaque lag de 0 à q
+exog_terms_list <- lapply(exog_vars, function(var) {
+  paste0("L(", var, ",", 0:q, ")")
+})
+exog_terms <- paste(unlist(exog_terms_list), collapse = " + ")
+
+# 3.3. Construction et ajustement du modèle
+formula_adl <- as.formula(paste(series, "~", lags_y, "+", exog_terms))
+model_adl <- dynlm(formula_adl, data = data_full)
+print(summary(model_adl))
+
+# Diagnostics des résidus
+cat("Ljung-Box (autocorrélation) p-value: ",
+    Box.test(residuals(model_adl), lag = 10, type = "Ljung-Box")$p.value, sep = "", "
+")
+cat("ARCH LM (hétéroscédasticité) p-value: ",
+    ArchTest(residuals(model_adl), lags = 5)$p.value, sep = "", "
+")
+
+# Extraction des résidus pour la simulation
+eps <- residuals(model_adl)
+```
+Le modèle n'est pas concluant, on va donc tenter de faire un ADL(1,0) :
+```{r}
+library(dynlm)
+library(boot)
+
+# Redéfinir ici le nom des variables exogènes utilisées
+exog_vars <- c("Mean_10m_wind", "Mean_total_precipitation",
+               "Mean_2m_temperature", "Mean_cape")
+
+# 3. Estimation du modèle ADL(1, 0)
+# -----------------------------------
+# On cherche à modéliser ret_log en fonction de son lag 1 et de l'exogène au temps t
+# Choix : p = 1, q = 0
+series <- "ret_log"
+p <- 1; q <- 0
+
+# Construire la formule simple
+# Terme autorégressif
+lag_term <- paste0("L(", series, ",1)")
+# Terme exogène contemporain
+exog_term <- paste(exog_vars, collapse = " + ")
+formula_adl10 <- as.formula(paste(series, "~", lag_term, "+", exog_term))
+
+# Ajustement du modèle ADL(1,0)
+model_adl10 <- dynlm(formula_adl10, data = data_full)
+print(summary(model_adl10))
+
+# Diagnostics des résidus
+cat("Ljung-Box p-value: ",
+    Box.test(residuals(model_adl10), lag = 10, type = "Ljung-Box")$p.value, "
+")
+cat("ARCH LM p-value: ",
+    ArchTest(residuals(model_adl10), lags = 5)$p.value, "
+")
+
+# Extraction des résidus
+residuals_adl10 <- residuals(model_adl10)
+
+```
+
+```{r}
+library(dynlm)
+library(boot)
+
+# Redéfinir ici le nom des variables exogènes utilisées
+exog_vars <- c("Mean_10m_wind", "Mean_total_precipitation",
+               "Mean_2m_temperature", "Mean_cape")
+
+# 3. Estimation du modèle ADL(1, 0)
+# -----------------------------------
+# On cherche à modéliser ret_log en fonction de son lag 1 et de l'exogène au temps t
+# Choix : p = 1, q = 0
+series <- "ret_log"
+p <- 1; q <- 1
+
+# Construire la formule simple
+# Terme autorégressif
+lag_term <- paste0("L(", series, ",1)")
+# Terme exogène contemporain
+exog_term <- paste(exog_vars, collapse = " + ")
+formula_adl10 <- as.formula(paste(series, "~", lag_term, "+", exog_term))
+
+# Ajustement du modèle ADL(1,0)
+model_adl10 <- dynlm(formula_adl10, data = data_full)
+print(summary(model_adl10))
+
+# Diagnostics des résidus
+cat("Ljung-Box p-value: ",
+    Box.test(residuals(model_adl10), lag = 10, type = "Ljung-Box")$p.value, "
+")
+cat("ARCH LM p-value: ",
+    ArchTest(residuals(model_adl10), lags = 5)$p.value, "
+")
+
+# Extraction des résidus
+residuals_adl10 <- residuals(model_adl10)
+
+```
+
+Toujours aucune variable pertinente, nous allons donc passer à une sélection via LASSO pour tenter de voir si l'une des variables sors tout de même du lot.
+```{r}
+# 3.5 Sélection des variables exogènes par LASSO
+library(glmnet)
+
+# Crée ret_log_lag1 et les lags 1 des exogènes
+df_lasso <- data_full %>%
+  mutate(ret_log_lag1 = lag(ret_log, 1)) %>%
+  drop_na()
+for(v in exog_vars) {
+  df_lasso[[paste0(v, "_lag1")]] <- lag(df_lasso[[v]], 1)
+}
+df_lasso <- df_lasso %>% drop_na()
+
+# Matrice X et vecteur y
+y <- df_lasso$ret_log
+Xvars <- c("ret_log_lag1", exog_vars, paste0(exog_vars, "_lag1"))
+X <- as.matrix(df_lasso[, Xvars])
+
+# Cross-validation LASSO
+set.seed(123)
+cv_lasso <- cv.glmnet(X, y, alpha = 1, nfolds = 10)
+
+# Coefficients à lambda.min
+beta_lasso <- coef(cv_lasso, s = "lambda.min")
+print(beta_lasso)
+
+# Variables retenues (coef != 0)
+selected <- rownames(beta_lasso)[beta_lasso[,1] != 0]
+selected <- setdiff(selected, "(Intercept)")
+cat("Variables sélectionnées par LASSO :", paste(selected, collapse = ", "), "\n")
+```
+
+On refait un ADL filtré sur les deux variables qui sont ressorties :
+```{r}
+library(dynlm)
+# on part de df_lasso (sans NA)
+formula_filtre <- ret_log ~ ret_log_lag1 + Mean_total_precipitation
+model_filtre  <- dynlm(formula_filtre, data = df_lasso)
+summary(model_filtre)
+
+```
+
+
+
+Code V2, on recommence au début de la partie 3 :
+```{r}
+# Weather VaR analysis in R (ADL avec ret_log corrigé)
+# ============================================
+# On part de data_full contenant :
+# - data_full$ret_log calculé
+# - les variables exogènes initiales dans `exog_vars`
+
+library(dynlm)
+library(boot)
+
+# Redéfinir ici le nom des variables exogènes utilisées
+exog_vars <- c("Mean_10m_wind", "Mean_total_precipitation",
+               "Mean_2m_temperature", "Mean_cape")
+
+# 3. Estimation du modèle ADL(1, 0)
+# -----------------------------------
+# On cherche à modéliser ret_log en fonction de son lag 1 et de l'exogène au temps t
+# Choix : p = 1, q = 0
+series <- "ret_log"
+p <- 1; q <- 0
+
+# Construire la formule simple
+# Terme autorégressif
+lag_term <- paste0("L(", series, ",1)")
+# Terme exogène contemporain
+exog_term <- paste(exog_vars, collapse = " + ")
+formula_adl10 <- as.formula(paste(series, "~", lag_term, "+", exog_term))
+
+# Ajustement du modèle ADL(1,0)
+model_adl10 <- dynlm(formula_adl10, data = data_full)
+print(summary(model_adl10))
+
+# Diagnostics des résidus
+cat("Ljung-Box p-value: ",
+    Box.test(residuals(model_adl10), lag = 10, type = "Ljung-Box")$p.value, "
+")
+cat("ARCH LM p-value: ",
+    ArchTest(residuals(model_adl10), lags = 5)$p.value, "
+")
+
+# Extraction des résidus
+residuals_adl10 <- residuals(model_adl10)
+```
+
+
+```{r}
+# 3.5 Sélection des variables exogènes par LASSO
+# ------------------------------------------------
+library(glmnet)
+
+# Préparation des données pour LASSO
+# On crée ret_log lag1, exogènes t et exogènes lag1
+df_lasso <- data_full %>%
+  mutate(ret_log_lag1 = lag(ret_log, 1)) %>%
+  drop_na()  # enlève lignes NA dues aux lags
+
+# Matrice X pour LASSO: ret_log_lag1 + exogènes + leurs lags 1
+Xvars <- c("ret_log_lag1", exog_vars, paste0(exog_vars, "_lag1"))
+# Ajouter les lags 1 des exogènes
+for(v in exog_vars) {
+  df_lasso[[paste0(v, "_lag1")]] <- lag(df_lasso[[v]], 1)
+}
+df_lasso <- df_lasso %>% drop_na()
+
+# y et X
+y <- df_lasso$ret_log
+X <- as.matrix(df_lasso[, Xvars])
+
+# Cross-validation LASSO
+set.seed(123)
+cv_lasso <- cv.glmnet(X, y, alpha = 1, nfolds = 10)
+
+# Coefficients retenus à lambda.min
+beta_lasso <- coef(cv_lasso, s = "lambda.min")
+print(beta_lasso)
+
+# Variables avec coef != 0 (hors intercept)
+selected <- rownames(beta_lasso)[beta_lasso[,1] != 0]
+selected <- setdiff(selected, "(Intercept)")
+cat("Variables sélectionnées par LASSO :", paste(selected, collapse = ", "), "
+")
+```
+
+
+```{r}
+# 3.6 Estimation du modèle filtré par LASSO
+# -------------------------------------------
+# Les variables sélectionnées sont : ret_log_lag1 et Mean_total_precipitation
+df_filtre <- df_lasso  # df_lasso contient déjà lag1 et ret_log
+
+formula_filtre <- as.formula(
+  "ret_log ~ ret_log_lag1 + Mean_total_precipitation"
+)
+model_filtre <- dynlm(formula_filtre, data = df_filtre)
+print(summary(model_filtre))
+
+# Diagnostics sur le modèle filtré
+eps_filtre <- residuals(model_filtre)
+cat("Ljung-Box p-value: ",
+    Box.test(eps_filtre, lag = 10, type = "Ljung-Box")$p.value, "
+")
+cat("ARCH LM p-value: ",
+    ArchTest(eps_filtre, lags = 5)$p.value, "
+")
+
+# Si Mean_total_precipitation est significative (p < 0.05), on passe au bootstrap exogène
+```
+
+
+```{r}
+# 4. Bootstrap bloc et simulation Monte-Carlo
+# -------------------------------------------
+# 4.1 Extraction de la série météo retenue
+df_mc <- df_lasso  # df_lasso a déjà les lags et ret_log
+precip <- df_mc$Mean_total_precipitation  # variable sélectionnée
+```
+
+
+```{r}
+# 4.2 Bootstrap bloc de longueur 30 jours
+library(boot)
+block_length <- 30
+# Fonction de génération de blocs
+gen_block <- function(x, inds) x[inds]
+```
+
+
+```{r}
+# 4.3 Simulation Monte-Carlo sur H = 30 jours, N tirages
+H <- 30
+N <- 10000
+# pertes sous forme de log-loss initialisé
+losses_log <- numeric(N)
+
+# Extraire coefficients et résidus du modèle filtré
+coef_all       <- coef(model_filtre)
+intercept_mc   <- coef_all["(Intercept)"]
+phi_mc         <- coef_all["ret_log_lag1"]
+beta_precip_mc <- coef_all["Mean_total_precipitation"]
+eps_mc         <- residuals(model_filtre)
+
+# Dernier log-return observé
+last_ret <- tail(df_lasso$ret_log, 1)
+# Prix de départ
+P0 <- tail(data_full$mean_price_square_meter, 1)
+
+set.seed(123)
+for (b in seq_len(N)) {
+  # Bootstrap bloc fixe sur la série de précipitations
+  bs   <- tsboot(precip, gen_block, R = 1, l = block_length, sim = "fixed")
+  Xsim <- bs$t[1:H]
+
+  # Générer trajectoire de rendements
+  prev_ret <- last_ret
+  r_path   <- numeric(H)
+  for (t in seq_len(H)) {
+    # Prévision du rendement
+    r_hat <- intercept_mc + phi_mc * prev_ret + beta_precip_mc * Xsim[t]
+    # Tirer un choc résiduel
+    eps_t <- sample(eps_mc, 1, replace = TRUE)
+    # Rendement simulé
+    r_t <- r_hat + eps_t
+    r_path[t] <- r_t
+    prev_ret <- r_t
+  }
+  # Log-loss: log(P0/P_T)
+  losses_log[b] <- - sum(r_path)
+}
+```
+
+
+```{r}
+# 4.4 Conversion du log-loss en perte de capital et calcul de la VaR
+# P_T = P0 * exp(sum r_path) --> loss_pct = 1 - P_T/P0 = 1 - exp(sum r_path)
+losses_pct <- 1 - exp(- losses_log)
+alpha <- 0.95
+weather_var_pct <- quantile(losses_pct, probs = alpha)
+
+cat(sprintf("Weather VaR %.0f%% sur %d jours = %.2f%% de perte de capital
+", 
+            alpha*100, H, weather_var_pct * 100))
+
+```
+Ici on a inclus météo + volatilité, d'où le fait que ce soit très élevé. On va maintenant isoler le facteur météo seul :
+```{r}
+# --- Extraction du beta météo (filtré) et de la série precip bootstrappée ---
+beta_precip  <- coef(model_filtre)["Mean_total_precipitation"]
+precip       <- df_lasso$Mean_total_precipitation
+
+# Simulation bootstrap bloc sur la précipitation seule
+library(boot)
+block_length <- 30
+gen_block    <- function(x, inds) x[inds]
+H <- 30; N <- 10000
+
+weather_losses <- numeric(N)
+set.seed(123)
+for(b in seq_len(N)) {
+  bs    <- tsboot(precip, gen_block, R = 1, l = block_length, sim = "fixed")
+  Xsim  <- bs$t[1:H]
+  # P&L météo cumulé en log-returns
+  meteo_logPnl <- beta_precip * Xsim
+  # per­te de capi­tal = 1 - exp(sum(r_meteo))
+  weather_losses[b] <- 1 - exp(sum(meteo_logPnl))
+}
+
+# VaR 95% sur 30 jours (météo-seul)
+alpha <- 0.95
+weatherVar_pourcent <- quantile(weather_losses, probs = alpha) * 100
+cat(sprintf("Weather-only VaR %.0f%% sur %d jours = %.2f%% de perte\\n",
+            alpha*100, H, weatherVar_pourcent))
+
+```
+La VaR nous parrait encore très élevé, nous allons faire du backtesting :
+inspectons d'abord la distribution des pertes météo :
+```{r}
+# Résumé et quantiles clés
+summary(weather_losses)
+quantile(weather_losses, probs = c(0.5, 0.90, 0.95, 0.99))
+
+# Histogramme (base R)
+hist(weather_losses, breaks = 50,
+     main = "Distribution of weather losses over 30 days",
+     xlab = "Losses (%)", ylab = "Frequency")
+```
+```{r}
+# Sauvegarder l'histogramme :
+library(ggplot2)
+
+p <- ggplot(data.frame(loss = weather_losses), aes(x = loss)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of weather losses over 30 days",
+    x     = "Losses (%)",
+    y     = "Frequency"
+  ) +
+  theme_minimal()
+
+# Afficher à l’écran
+print(p)
+
+# Sauvegarder en PNG (ou PDF, SVG…)
+ggsave("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/hist_weather_losses_gg.png", plot = p, width = 8, height = 6, dpi = 100)
+```
+
+
+On teste de standardiser à nouveau notre série :
+```{r}
+library(readxl)
+library(dplyr)
+
+# 1. Recharger la série brute (en mm ou en l’unité d’origine)
+exog_raw <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/WeatherVaR/Data/All_exog_data_daily.xlsx") %>%
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Date)
+
+# Supposons que votre variable brute s'appelle Mean_total_precipitation_raw
+precip_raw <- exog_raw$Mean_total_precipitation
+
+# 2. Calculer mean et sd
+mean_p <- mean(precip_raw, na.rm = TRUE)
+sd_p   <- sd(precip_raw,   na.rm = TRUE)
+
+cat(sprintf("Précip brut : mean = %.2f mm,  sd = %.2f mm\n", mean_p, sd_p))
+
+# 3. Quantiles bruts
+summary(precip_raw)
+quantile(precip_raw, probs = c(0.90, 0.95, 0.99), na.rm = TRUE)
+
+# 4. Pour interpréter un z-score de +2 :
+z <- 2
+precip_mm_at_z2 <- mean_p + z * sd_p
+cat(sprintf("Un z-score = %.1f correspond à ≈ %.1f mm de précipitations/jour\n",
+            z, precip_mm_at_z2))
+
+# 5. Pour voir la distribution brute
+hist(precip_raw, breaks = 50,
+     main = "Histogramme des précipitations brutes",
+     xlab = "Précipitation (mm/jour)")
+```
+
+On teste également un scénario 5-day heavy rain :
+```{r}
+# Scénario : 7 jours consécutifs à +2σ
+beta  <- beta_precip
+scenario <- rep(2, 7)  # z-score = 2 tous les jours
+r_scn    <- beta * scenario
+loss_scn <- 1 - exp(sum(r_scn))
+cat(sprintf("Stress 7j à +2σ → perte = %.2f%%\\n", loss_scn*100))
+```
+
+Nous transformons nos données pour passer en mm et non en m, cela sera mieux à l'échèlle :
+```{r}
+# Ex. sans scale():
+prec_mm <- exog_raw$Mean_total_precipitation * 1000  # si c'est en m → mm
+data_full$prec_mm <- prec_mm  # après alignement
+
+# New ADL 1,0
+model_raw <- dynlm(ret_log ~ L(ret_log,1) + prec_mm, data = data_full)
+summary(model_raw)
+```
+Aucun effet significatif, on teste un ADl(1,1):
+```{r}
+model_adl11_raw <- dynlm(
+  ret_log ~ L(ret_log,1) + prec_mm + L(prec_mm,1),
+  data = data_full
+)
+summary(model_adl11_raw)
+```
+Calcul d'une potentielle anomalie meteo :
+```{r}
+data_full$prec_anom <- data_full$prec_mm - mean(data_full$prec_mm, na.rm=TRUE)
+model_anom <- dynlm(ret_log ~ L(ret_log,1) + prec_anom, data = data_full)
+summary(model_anom)
+```
+
+Aucune variable météo n'est valable pour réaliser une VaR.
+Nous allons donc tenter de capter les épisodes pluvieux :
+```{r}
+# 5. Scénario de stress : 7 jours de fortes pluies
+
+library(readxl)
+library(dplyr)
+
+# 5.1 Charger et parser la date
+raw <- read_excel(
+  "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Database/Climate data/V2. Daily/Drought_fire risk/Total precipitation V2/Data_precipitation_daily.xlsx",
+  col_types = c("date", "numeric")
+) %>%
+  rename(precip_m = Daily_precipitation)
+
+# 5.2 Conversion en mm
+raw <- raw %>% mutate(precip_mm = precip_m * 1000)
+
+# 5.3 Calcul du 95ᵉ percentile
+q95 <- quantile(raw$precip_mm, probs = 0.95, na.rm = TRUE)
+cat(sprintf("95ᵉ percentile précip = %.2f mm/day\n", q95))
+
+# 5.4 Scénario : 7 jours à q95
+H_stress      <- 7
+scenario_precip <- rep(q95, H_stress)
+
+# 5.5 Impact sur les log-returns (avec beta de votre dernier ADL)
+beta_prec_mm <- coef(model_raw)["prec_mm"]  # ajustez selon votre objet
+dr_stress    <- beta_prec_mm * scenario_precip
+
+# 5.6 Perte de capital cumulée
+loss_stress <- 1 - exp(sum(dr_stress))
+cat(sprintf("Stress %d j à 95ᵉ %% → loss = %.2f%%\n",
+            H_stress, loss_stress * 100))
+
+```
+Nous pouvons conclure que même le facteur climatique le plus correlé au prix de l'immobilier, n'a pas d'impact réel sur son prix. Et ce même en cas d'épisode de pluie majeur de l'ordre de 4.92mm par jour.

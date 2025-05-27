@@ -1,0 +1,234 @@
+---
+title: "ARIMA_Global_Witness_050525"
+author: "H.JUGAND"
+date: "2025-05-05"
+output: word_document
+---
+
+```{r}
+# 1. Importation des librairies
+library(readxl)
+library(quantmod)
+library(tidyquant)
+library(tseries)
+library(forecast)
+library(dplyr)      # pipe, mutate…
+library(lubridate)  # pour year(), month()
+library(ggplot2)    # courbes, graphiques
+library(tseries)    # adf.test(), kpss.test(), pp.test()
+library(forecast)   # ndiffs(), nsdiffs(), autoplot.ts
+library(MuMIn)      # Pour la fonction AICc
+library(ggplotify) 
+
+# 1.1 Lire les fichiers
+global_data  <- read_excel("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Database/0. Data à utiliser/Data_Global.xlsx")
+# View(global_data)
+# chartSeries(global_data)
+
+```
+
+
+```{r}
+# 1. Nettoyage & mise en forme
+
+df <- global_data %>%                     
+  rename(
+    date      = Month,
+    price_m2  = `Mean price per square meter`
+  ) %>%
+  mutate(date = as.Date(date)) %>%          
+  arrange(date)
+
+# 1.1 Option “xts” 
+library(xts)
+xts_price <- xts(df$price_m2, order.by = df$date)
+
+# 1.2 Option “ts” 
+start_year  <- year(first(df$date))
+start_month <- month(first(df$date))
+ts_price <- ts(df$price_m2,
+               start      = c(start_year, start_month),
+               frequency  = 12)             # mensuel
+```
+
+
+```{r}
+# 2. Visualisation rapide
+
+p1 <- autoplot(ts_price) +
+  labs(title = "Average price €/m² (gross series)",
+       x     = "Year", y = "€ / m²")
+
+# ACF / PACF
+acf_plot  <- forecast::ggAcf(ts_price, lag.max = 60) + ggtitle("ACF gross series")
+pacf_plot <- forecast::ggPacf(ts_price, lag.max = 60) + ggtitle("PACF gross series")
+```
+
+
+```{r}
+# Save the previous graph
+
+# Average price (gross series)
+ggsave(
+  filename = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMA_global/Graph/average_price.png",  
+  plot     = p1,                       
+  device   = "png",                    
+  width    = 8,                        
+  height   = 6,                        
+  dpi      = 300                       
+)
+
+# ACF 
+ggsave("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMA_global/Graph/Acf_ts_price.png", plot = acf_plot,
+       width = 8, height = 6, dpi = 300)
+
+# PACF 
+ggsave("C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMA_global/Graph/Pacf_ts_price.png", plot = pacf_plot,
+       width = 8, height = 6, dpi = 300)
+
+nsdiffs(ts_price)
+```
+
+
+```{r}
+# ──────────────────────────────────────────
+# 3. Tests de stationnarité
+# ──────────────────────────────────────────
+adf     <- adf.test(ts_price, alternative = "stationary")   # H0 : non-stationnaire
+pp      <- pp.test(ts_price,  alternative = "stationary")
+kpss_L  <- kpss.test(ts_price, null = "Level")               # H0 : stationnaire (niveau)
+kpss_T  <- kpss.test(ts_price, null = "Trend")               # H0 : stationnaire (tendance)
+
+adf
+pp
+kpss_L
+kpss_T
+```
+
+
+```{r}
+# 4. Nombre de différenciations nécessaires
+
+d <- ndiffs(ts_price)       # ordinaire (pour la tendance)
+D <- nsdiffs(ts_price)      # saisonnière (lag 12)
+
+cat("→ Différence(s) ordinaire(s) à appliquer (d) :", d, "\n")
+cat("→ Différence(s) saisonnière(s) à appliquer (D):", D, "\n")
+```
+
+
+```{r}
+# 5. série stationnarisée
+
+y <- diff(ts_price, differences = d)              # d fois
+if (D > 0) y <- diff(y, lag = 12, differences = D)  # D fois (saison)
+autoplot(y) + labs(title = "Série après différenciation")
+forecast::ggAcf(y, lag.max = 60) + ggtitle("ACF après diff.")
+forecast::ggPacf(y, lag.max = 60) + ggtitle("PACF après diff.")
+
+
+```
+
+```{r}
+adf.test(y) 
+kpss.test(y)
+```
+Nous arrivons à un résultat que la série est bien stationnaire. Nous allons donc chercher le meilleur modèle ARIMA
+
+```{r}
+library(forecast)
+
+# 1. Sélection automatique des ordres p et q
+fit <- auto.arima(ts_price,
+                  d = 1,         
+                  D = 0,
+                  seasonal = FALSE,
+                  stepwise = FALSE,
+                  approximation = FALSE)
+
+summary(fit)          # affiche (p,d,q), AICc, coefficients…
+
+# 2. Diagnostics : résidus ~ bruit blanc ?
+fit_exp <- checkresiduals(fit)   # ACF/PACF des résidus + test Ljung–Box
+show(fit_exp)
+
+# 3. Prévisions sur 60 mois
+fc <- forecast(fit, h = 60)
+fc_exp <- autoplot(fc)
+show(fc_exp)
+
+```
+
+
+```{r}
+library(forecast)   # auto.arima(), checkresiduals(), forecast(), autoplot()
+library(ggplot2)    # ggsave()
+
+# ── 0. Ajustement du modèle ARIMA ───────────────────────
+fit <- auto.arima(ts_price,
+                  d             = 1,
+                  D             = 0,
+                  seasonal      = FALSE,
+                  stepwise      = FALSE,
+                  approximation = FALSE)
+
+# ── 1. Diagnostic des résidus via checkresiduals() ──────
+# On utilise directement le device PNG + base plotting :
+png(filename = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMA_global/Graph/white_noise.png",
+    width    = 8,    # en pouces
+    height   = 6,
+    units    = "in",
+    res      = 300)  # 300 dpi
+
+checkresiduals(fit)  # trace sur l’appareil PNG
+dev.off()            # referme et écrit le fichier
+
+# ── 2. Prévisions sur 60 périodes + export avec ggplot ──
+fc   <- forecast(fit, h = 60)    # calcul des prévisions
+p_fc <- autoplot(fc)             # ggplot
+
+# ggsave() capte l’objet ggplot (p_fc) et l’exporte
+ggsave(filename = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/Base_ARIMA_global/Graph/arima_2_1_2.png",
+       plot     = p_fc,
+       width    = 8,
+       height   = 6,
+       dpi      = 300)
+
+```
+
+
+Back-testing meilleur modèle
+```{r}
+# 1. Modèle alternatif plus simple
+fit_alt <- Arima(ts_price, order = c(2,1,2), include.drift = TRUE)
+
+# 1.1 Comparaison AICc
+AICc(fit, fit_alt)  
+
+```
+Nous confirmons que le modèle utilisé précédemment est le meilleur, il a un AICc plus bas que notre modèle alternatif plus simple
+
+
+```{r}
+# Prévisions 60 mois que tu as déjà calculées
+fc <- forecast(fit, h = 60)
+
+# On prépare un data-frame clair
+out <- data.frame(
+  date      = as.Date(time(fc$mean)),
+  point_fc  = as.numeric(fc$mean),
+  lower80   = as.numeric(fc$lower[, "80%"]),
+  upper80   = as.numeric(fc$upper[, "80%"]),
+  lower95   = as.numeric(fc$lower[, "95%"]),
+  upper95   = as.numeric(fc$upper[, "95%"])
+)
+
+# Chemin d’export – utilise / ou \\ pour échapper les \ dans Windows
+write.csv(
+  out,
+  file = "C:/Users/hugoj/Desktop/ESSCA/6. Mémoire/1. redaction/3. Livrable 3/Analyse/forecast_ARIMA_global.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"   # évite les soucis d’accents
+)
+```
+
